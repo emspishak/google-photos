@@ -20,11 +20,13 @@ import bodyParser from 'body-parser';
 import express from 'express';
 import expressWinston from 'express-winston';
 import fetch from 'node-fetch';
+import fs from 'fs';
 import http from 'http';
 import passport from 'passport';
 import persist from 'node-persist';
 import session from 'express-session';
 import sessionFileStore from 'session-file-store';
+import util from 'util';
 import winston from 'winston';
 
 import {auth} from './auth.js';
@@ -327,11 +329,11 @@ app.get('/getAlbums', async (req, res) => {
 
   // Attempt to load the albums from cache if available.
   // Temporarily caching the albums makes the app more responsive.
-  const cachedAlbums = await albumCache.getItem(userId);
-  if (cachedAlbums) {
-    logger.verbose('Loaded albums from cache.');
-    res.status(200).send(cachedAlbums);
-  } else {
+  // const cachedAlbums = await albumCache.getItem(userId);
+  // if (cachedAlbums) {
+  //   logger.verbose('Loaded albums from cache.');
+  //   res.status(200).send(cachedAlbums);
+  // } else {
     logger.verbose('Loading albums from API.');
     // Albums not in cache, retrieve the albums from the Library API
     // and return them
@@ -349,7 +351,7 @@ app.get('/getAlbums', async (req, res) => {
       res.status(200).send(data);
       albumCache.setItem(userId, data);
     }
-  }
+  // }
 });
 
 
@@ -546,7 +548,7 @@ async function libraryApiGetAlbums(authToken) {
       logger.verbose(`Loading albums. Received so far: ${albums.length}`);
       // Make a GET request to load the albums with optional parameters (the
       // pageToken if set).
-      const albumResponse = await fetch(config.apiEndpoint + '/v1/albums?' + parameters, {
+      const albumResponse = await fetch(config.apiEndpoint + '/v1/sharedAlbums?' + parameters, {
         method: 'get',
         headers: {
           'Content-Type': 'application/json',
@@ -556,12 +558,12 @@ async function libraryApiGetAlbums(authToken) {
 
       const result = await checkStatus(albumResponse);
 
-      logger.debug(`Response: ${result}`);
+      // logger.debug(`Response: ${JSON.stringify(result)}`);
 
-      if (result && result.albums) {
-        logger.verbose(`Number of albums received: ${result.albums.length}`);
+      if (result && result.sharedAlbums) {
+        logger.verbose(`Number of albums received: ${result.sharedAlbums.length}`);
         // Parse albums and add them to the list, skipping empty entries.
-        const items = result.albums.filter(x => !!x);
+        const items = result.sharedAlbums.filter(x => !!x);
 
         albums = albums.concat(items);
       }
@@ -582,7 +584,145 @@ async function libraryApiGetAlbums(authToken) {
   }
 
   logger.info('Albums loaded.');
+  console.log(util.inspect(albums, { depth: null }));
+  console.log(`total photos in shared albums: ${albums.reduce((accumulator, album) => accumulator + parseInt(album.mediaItemsCount ?? '0'), 0)}`);
+
+  const photosInSharedAlbum = new Set();
+  if (fs.existsSync('photosInSharedAlbum.txt')) {
+    fs.readFileSync('photosInSharedAlbum.txt').toString().split('\n').forEach(photosInSharedAlbum.add, photosInSharedAlbum);
+  } else {
+    for (const album of albums) {
+      console.log(`fetching photos in ${album.title}`);
+
+      let nextPageToken;
+      do {
+        const albumItemResponse = await fetch(config.apiEndpoint + '/v1/mediaItems:search', {
+          method: 'POST',
+          body: JSON.stringify({
+            pageSize: config.albumPageSize,
+            albumId: album.id,
+            pageToken: nextPageToken,
+          }),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + authToken
+          },
+        });
+
+        const result = await checkStatus(albumItemResponse);
+        console.log(`  fetched ${result.mediaItems?.length} more photos`);
+
+        // logger.debug(`Response: ${JSON.stringify(result)}`);
+        if (result.mediaItems) {
+          result.mediaItems.map((item) => item.id).forEach(photosInSharedAlbum.add, photosInSharedAlbum);
+        }
+        nextPageToken = result.nextPageToken;
+        // console.log(nextPageToken);
+      } while (nextPageToken);
+    }
+    fs.writeFileSync('photosInSharedAlbum.txt', Array.from(photosInSharedAlbum).join('\n'));
+  }
+
+  console.log(photosInSharedAlbum);
+  console.log(`photosInSharedAlbum: ${photosInSharedAlbum.size}`)
+
+  const allPhotos = await getAllPhotos(authToken);
+
+  const photosNotInSharedAlbum = allPhotos.difference(photosInSharedAlbum);
+  console.log(`photosNotInSharedAlbum: ${photosNotInSharedAlbum.size}`);
+
+  await createAlbums(authToken, Array.from(photosNotInSharedAlbum));
+
   return {albums, error};
+}
+
+async function getAllPhotos(authToken) {
+  const allPhotos = new Set();
+  if (fs.existsSync('allPhotos.txt')) {
+    fs.readFileSync('allPhotos.txt').toString().split('\n').forEach(allPhotos.add, allPhotos);
+  } else {
+    let nextPageToken;
+    do {
+      let parameters = new URLSearchParams();
+      parameters.append('pageSize', config.searchPageSize);
+      if (nextPageToken) {
+        parameters.append('pageToken', nextPageToken);
+      }
+      const itemsResponse = await fetch(config.apiEndpoint + '/v1/mediaItems?' + parameters, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + authToken
+        },
+      });
+
+      const result = await checkStatus(itemsResponse);
+
+      // logger.debug(`Response: ${JSON.stringify(result)}`);
+      if (result.mediaItems) {
+        result.mediaItems.map((item) => item.id).forEach(allPhotos.add, allPhotos);
+      }
+      console.log(`  fetched ${result.mediaItems?.length} more photos, ${allPhotos.size} total`);
+      nextPageToken = result.nextPageToken;
+      // console.log(nextPageToken);
+    } while (nextPageToken);
+    fs.writeFileSync('allPhotos.txt', Array.from(allPhotos).join('\n'));
+  }
+  console.log(`found ${allPhotos.size} total photos`);
+  return allPhotos;
+}
+
+async function createAlbums(authToken, ids) {
+  const chunkSize = 19000;
+  const timestamp = new Date().toString();
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    await createAlbum(authToken, chunk, `${timestamp} - ${i / chunkSize}`);
+  }
+}
+
+async function createAlbum(authToken, ids, timestamp) {
+  const createResponse = await fetch(config.apiEndpoint + '/v1/albums', {
+    method: 'POST',
+    body: JSON.stringify({
+      album: {
+        title: `Photos not in shared album - ${timestamp}`,
+      },
+    }),
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + authToken
+    },
+  });
+  const result = await checkStatus(createResponse);
+  console.log(util.inspect(result, {depth: null}));
+
+  const albumId = result.id;
+
+  const chunkSize = 1;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    console.log(`  adding from ${i}`);
+    const chunk = ids.slice(i, i + chunkSize);
+    console.log(chunk);
+    const addResponse = await fetch(`${config.apiEndpoint}/v1/albums/${albumId}:batchAddMediaItems`, {
+      method: 'POST',
+      body: JSON.stringify({
+        mediaItemIds: JSON.stringify(chunk),
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + authToken
+      },
+    });
+    // const addResponse = await fetch(`${config.apiEndpoint}/v1/mediaItems/${chunk[0]}`,{
+    //   headers: {
+    //     'Content-Type': 'application/json',
+    //     'Authorization': 'Bearer ' + authToken
+    //   },
+    // })
+    const result = await checkStatus(addResponse);
+    console.log(util.inspect(result, {depth: null}));
+  }
 }
 
 // Return the body as JSON if the request was successful, or thrown a StatusError.
