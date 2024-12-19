@@ -631,7 +631,8 @@ async function libraryApiGetAlbums(authToken) {
   const photosNotInSharedAlbum = allPhotos.difference(photosInSharedAlbum);
   console.log(`photosNotInSharedAlbum: ${photosNotInSharedAlbum.size}`);
 
-  await createAlbums(authToken, Array.from(photosNotInSharedAlbum));
+  const cookie = new Cookies(process.env.PHOTOS_GOOGLE_COM_COOKIES);
+  await createAlbums(authToken, cookie, Array.from(photosNotInSharedAlbum));
 
   return {albums, error};
 }
@@ -672,16 +673,16 @@ async function getAllPhotos(authToken) {
   return allPhotos;
 }
 
-async function createAlbums(authToken, ids) {
+async function createAlbums(authToken, cookie, ids) {
   const chunkSize = 19000;
   const timestamp = new Date().toString();
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
-    await createAlbum(authToken, chunk, `${timestamp} - ${i / chunkSize}`);
+    await createAlbum(authToken, cookie, chunk, `${timestamp} - ${i / chunkSize}`);
   }
 }
 
-async function createAlbum(authToken, ids, timestamp) {
+async function createAlbum(authToken, cookie, ids, timestamp) {
   const createResponse = await fetch(config.apiEndpoint + '/v1/albums', {
     method: 'POST',
     body: JSON.stringify({
@@ -698,31 +699,67 @@ async function createAlbum(authToken, ids, timestamp) {
   console.log(util.inspect(result, {depth: null}));
 
   const albumId = result.id;
+  const webAlbumId = await getWebId(cookie, 'album', albumId);
 
-  const chunkSize = 1;
+  const chunkSize = 50;
   for (let i = 0; i < ids.length; i += chunkSize) {
     console.log(`  adding from ${i}`);
     const chunk = ids.slice(i, i + chunkSize);
-    console.log(chunk);
-    const addResponse = await fetch(`${config.apiEndpoint}/v1/albums/${albumId}:batchAddMediaItems`, {
-      method: 'POST',
-      body: JSON.stringify({
-        mediaItemIds: JSON.stringify(chunk),
-      }),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + authToken
-      },
-    });
-    // const addResponse = await fetch(`${config.apiEndpoint}/v1/mediaItems/${chunk[0]}`,{
-    //   headers: {
-    //     'Content-Type': 'application/json',
-    //     'Authorization': 'Bearer ' + authToken
-    //   },
-    // })
-    const result = await checkStatus(addResponse);
-    console.log(util.inspect(result, {depth: null}));
+
+    const webPhotoIds = await Promise.all(chunk.map(async (rpcPhotoId) => {
+      return await getWebId(cookie, 'photo', rpcPhotoId)
+    }));
+
+    await addPhotosToAlbum(cookie, webAlbumId, webPhotoIds);
   }
+}
+
+class Cookies {
+  constructor(cookieString) {
+    this.cookies = new Map(cookieString.split('; ').map((wholeCookie) => wholeCookie.split('=')));
+  }
+
+  update(response) {
+    for (const header of response.headers.raw()['set-cookie']) {
+      const [name, value] = header.split('; ')[0].split('=');
+      this.cookies.set(name, value);
+    }
+  }
+
+  getString() {
+    return Array.from(this.cookies.entries().map((entry) => entry.join('='))).join('; ');
+  }
+}
+
+async function getWebId(cookie, type, rpcId) {
+  const response = await fetch(`https://photos.google.com/lr/${type}/${rpcId}`, {
+    headers: {
+      cookie: cookie.getString(),
+    },
+    redirect: 'manual',
+  });
+  if (response.status !== 301) {
+    throw new Error(`unexpected response for ${rpcId}: ${util.inspect(response, {depth: null})}`);
+  }
+  cookie.update(response);
+  return response.headers.get('location').replace(`https://photos.google.com/${type}/`, '');
+}
+
+async function addPhotosToAlbum(cookie, webAlbumId, webPhotoIds) {
+  const request = `[[["E1Cajb","[[\\"${webPhotoIds.join('\\",\\"')}\\"],\\"${webAlbumId}\\"]",null,"generic"]]]`;
+  const response = await fetch("https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=E1Cajb&source-path=%2F&f.sid=-8646556243711892999&bl=boq_photosuiserver_20241212.01_p1&hl=en&soc-app=165&soc-platform=1&soc-device=1&_reqid=5080415&rt=c", {
+    headers: {
+      cookie: cookie.getString(),
+     "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+    },
+    body: `f.req=${encodeURIComponent(request)}&at=AEEyM8P7Kmu9NGoX1RiXITlrMjXw%3A1734405614198&`,
+    method: "POST",
+    redirect: 'manual',
+  });
+  if (response.status !== 200) {
+    throw new Error (`unexpected response ${util.inspect(response, {depth: null})}`);
+  }
+  cookie.update(response);
 }
 
 // Return the body as JSON if the request was successful, or thrown a StatusError.
