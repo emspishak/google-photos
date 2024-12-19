@@ -717,6 +717,9 @@ async function createAlbum(authToken, cookie, ids, timestamp) {
 class Cookies {
   constructor(cookieString) {
     this.cookies = new Map(cookieString.split('; ').map((wholeCookie) => wholeCookie.split('=')));
+    this.count = 0;
+    const date = new Date();
+    this.reqidStart = date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
   }
 
   update(response) {
@@ -728,6 +731,10 @@ class Cookies {
 
   getString() {
     return Array.from(this.cookies.entries().map((entry) => entry.join('='))).join('; ');
+  }
+
+  getReqid() {
+    return 1 + this.reqidStart + this.count++ * 1E5;
   }
 }
 
@@ -747,7 +754,7 @@ async function getWebId(cookie, type, rpcId) {
 
 async function addPhotosToAlbum(cookie, webAlbumId, webPhotoIds) {
   const request = `[[["E1Cajb","[[\\"${webPhotoIds.join('\\",\\"')}\\"],\\"${webAlbumId}\\"]",null,"generic"]]]`;
-  const response = await fetch(`https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=E1Cajb&source-path=%2F&f.sid=-8646556243711892999&bl=boq_photosuiserver_20241212.01_p1&hl=en&soc-app=165&soc-platform=1&soc-device=1&_reqid=${Math.floor(Math.random() * 10000000)}&rt=c`, {
+  const response = await fetch(`https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=E1Cajb&source-path=%2F&f.sid=-8646556243711892999&bl=boq_photosuiserver_20241212.01_p1&hl=en&soc-app=165&soc-platform=1&soc-device=1&_reqid=${cookie.getReqid()}&rt=c`, {
     headers: {
       cookie: cookie.getString(),
      "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
