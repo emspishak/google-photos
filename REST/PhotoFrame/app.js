@@ -632,7 +632,11 @@ async function libraryApiGetAlbums(authToken) {
   console.log(`photosNotInSharedAlbum: ${photosNotInSharedAlbum.size}`);
 
   const cookie = new Cookies(process.env.PHOTOS_GOOGLE_COM_COOKIES);
-  await createAlbums(authToken, cookie, Array.from(photosNotInSharedAlbum));
+  try {
+    await createAlbums(authToken, cookie, Array.from(photosNotInSharedAlbum));
+  } finally {
+    cookie.writeResumeState();
+  }
 
   return {albums, error};
 }
@@ -675,42 +679,52 @@ async function getAllPhotos(authToken) {
 
 async function createAlbums(authToken, cookie, ids) {
   const chunkSize = 19000;
-  const timestamp = new Date().toString();
+  cookie.resumeState.albumTimestamp = cookie.resumeState.albumTimestamp ?? new Date().toString();
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
-    await createAlbum(authToken, cookie, chunk, `${timestamp} - ${i / chunkSize}`);
+    await createAlbum(authToken, cookie, chunk, i / chunkSize);
   }
 }
 
-async function createAlbum(authToken, cookie, ids, timestamp) {
-  const createResponse = await fetch(config.apiEndpoint + '/v1/albums', {
-    method: 'POST',
-    body: JSON.stringify({
-      album: {
-        title: `Photos not in shared album - ${timestamp}`,
+async function createAlbum(authToken, cookie, ids, iteration) {
+  if (cookie.resumeState.albums[iteration]) {
+    console.log(`continuing with index ${iteration}, album https://photos.google.com/album/${cookie.resumeState.albums[iteration]}`)
+  } else {
+    const createResponse = await fetch(config.apiEndpoint + '/v1/albums', {
+      method: 'POST',
+      body: JSON.stringify({
+        album: {
+          title: `Photos not in shared album - ${cookie.resumeState.albumTimestamp} - ${iteration}`,
+        },
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + authToken
       },
-    }),
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + authToken
-    },
-  });
-  const result = await checkStatus(createResponse);
-  console.log(util.inspect(result, {depth: null}));
+    });
+    const result = await checkStatus(createResponse);
+    console.log(util.inspect(result, {depth: null}));
 
-  const albumId = result.id;
-  const webAlbumId = await getWebId(cookie, 'album', albumId);
+    const albumId = result.id;
+    const webAlbumId = await getWebId(cookie, 'album', albumId);
+    cookie.resumeState.albums[iteration] = webAlbumId;
+  }
 
   const chunkSize = 50;
   for (let i = 0; i < ids.length; i += chunkSize) {
     console.log(`  adding from ${i}`);
-    const chunk = ids.slice(i, i + chunkSize);
+    const chunk = Array.from(new Set(ids.slice(i, i + chunkSize)).difference(cookie.resumeState.doneApiIds));
+    if (!chunk.length) {
+      // Skip the below if we've already added all.
+      continue;
+    }
 
     const webPhotoIds = await Promise.all(chunk.map(async (rpcPhotoId) => {
       return await getWebId(cookie, 'photo', rpcPhotoId)
     }));
 
-    await addPhotosToAlbum(cookie, webAlbumId, webPhotoIds);
+    await addPhotosToAlbum(cookie, cookie.resumeState.albums[iteration], webPhotoIds);
+    chunk.forEach(cookie.resumeState.doneApiIds.add, cookie.resumeState.doneApiIds);
   }
 }
 
@@ -720,6 +734,19 @@ class Cookies {
     this.count = 0;
     const date = new Date();
     this.reqidStart = date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
+    if (fs.existsSync('resume-state.json')) {
+      const read = JSON.parse(fs.readFileSync('resume-state.json'));
+      this.resumeState = {
+        ...read,
+        doneApiIds: new Set(read.doneApiIds),
+      }
+      console.log(`resumed with ${this.resumeState.doneApiIds.size} already done`);
+    } else {
+      this.resumeState = {
+        albums: [],
+        doneApiIds: new Set(),
+      };
+    }
   }
 
   update(response) {
@@ -735,6 +762,14 @@ class Cookies {
 
   getReqid() {
     return 1 + this.reqidStart + this.count++ * 1E5;
+  }
+
+  writeResumeState() {
+    const toWrite = {
+      ...this.resumeState,
+      doneApiIds: Array.from(this.resumeState.doneApiIds),
+    }
+    fs.writeFileSync('resume-state.json', JSON.stringify(toWrite));
   }
 }
 
